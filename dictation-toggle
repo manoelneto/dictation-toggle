@@ -1,0 +1,197 @@
+#!/bin/bash
+# Toggle voice-to-text: press once to record, press again to transcribe and type
+# Uses Whisper.cpp for high-quality offline speech recognition
+# Uses OpenAI API to aggressively improve/restructure the transcribed text
+# Uses xdotool to type the result into the focused window
+# Result is also copied to clipboard for Ctrl+V
+
+WHISPER="$HOME/.local/share/whisper.cpp/build/bin/whisper-cli"
+MODEL="$HOME/.local/share/whisper.cpp/models/ggml-large-v3.bin"
+AUDIO="/tmp/whisper-recording.wav"
+PID_FILE="/tmp/whisper-recording.pid"
+NOTIF_ID_FILE="/tmp/whisper-notif-id"
+LOG_FILE="/tmp/whisper-dictation.log"
+
+# Context files - captured at recording START
+CTX_WINDOW="/tmp/whisper-ctx-window"
+CTX_CLIPBOARD="/tmp/whisper-ctx-clipboard"
+CTX_SELECTION="/tmp/whisper-ctx-selection"
+
+# OpenAI API settings (key from OPENAI_API_KEY env variable)
+OPENAI_MODEL="gpt-5.4-mini"
+
+improve_text_with_llm() {
+  local raw_text="$1"
+  local context_window="$2"
+  local context_clipboard="$3"
+  local context_selection="$4"
+
+  local context_block=""
+  if [ -n "$context_window" ]; then
+    context_block="$context_block\nActive window: $context_window"
+  fi
+  if [ -n "$context_selection" ]; then
+    context_block="$context_block\nSelected/surrounding text: $context_selection"
+  fi
+  if [ -n "$context_clipboard" ]; then
+    context_block="$context_block\nClipboard content: $context_clipboard"
+  fi
+
+  local system_prompt="You are a text improvement assistant for voice dictation. Your job is to aggressively restructure and improve dictated text while preserving the original meaning and intent.
+
+Rules:
+- Fix all grammar, punctuation, and spelling errors
+- Restructure sentences for maximum clarity and readability
+- Remove filler words, repetitions, and verbal tics (um, uh, so, like, you know, basically)
+- Break run-on sentences into clear, concise ones
+- Improve word choice - replace vague words with precise ones
+- Maintain the original tone (formal/informal) and intent
+- If context is provided, adapt the style accordingly (e.g., code comment vs chat message vs email)
+- Output ONLY the improved text, nothing else - no quotes, no explanation, no preamble
+- Preserve the language of the original text (if Portuguese, output Portuguese; if English, output English)
+- Do NOT translate the text - keep it in the same language as the input"
+
+  local user_message="Improve this dictated text:"
+  if [ -n "$context_block" ]; then
+    user_message="$user_message\n\nContext:$context_block\n\nDictated text: $raw_text"
+  else
+    user_message="$user_message\n\n$raw_text"
+  fi
+
+  local payload
+  payload=$(jq -n \
+    --arg model "$OPENAI_MODEL" \
+    --arg system "$system_prompt" \
+    --arg user_msg "$user_message" \
+    '{
+      model: $model,
+      max_tokens: 4096,
+      messages: [
+        {role: "system", content: $system},
+        {role: "user", content: $user_msg}
+      ]
+    }')
+
+  local response
+  response=$(curl -s -w "\n%{http_code}" \
+    "https://api.openai.com/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -d "$payload" 2>>"$LOG_FILE")
+
+  local http_code
+  http_code=$(echo "$response" | tail -1)
+  local body
+  body=$(echo "$response" | sed '$d')
+
+  if [ "$http_code" = "200" ]; then
+    echo "$body" | jq -r '.choices[0].message.content'
+  else
+    echo "$(date): OpenAI API error (HTTP $http_code): $body" >> "$LOG_FILE"
+    # Fallback to raw text if API fails
+    echo "$raw_text"
+  fi
+}
+
+send_notification() {
+  local title="$1"
+  local body="$2"
+  local icon="$3"
+  local replace_id="${4:-0}"
+
+  local notif_id
+  notif_id=$(gdbus call --session \
+    --dest org.freedesktop.Notifications \
+    --object-path /org/freedesktop/Notifications \
+    --method org.freedesktop.Notifications.Notify \
+    "dictation-toggle" \
+    "$replace_id" \
+    "$icon" \
+    "$title" \
+    "$body" \
+    '[]' \
+    '{"urgency": <byte 1>}' \
+    0 2>/dev/null | grep -oP '\d+')
+
+  echo "$notif_id"
+}
+
+dismiss_notification() {
+  local notif_id="$1"
+  if [ -n "$notif_id" ] && [ "$notif_id" != "0" ]; then
+    gdbus call --session \
+      --dest org.freedesktop.Notifications \
+      --object-path /org/freedesktop/Notifications \
+      --method org.freedesktop.Notifications.CloseNotification \
+      "$notif_id" 2>/dev/null
+  fi
+}
+
+if [ -f "$PID_FILE" ]; then
+  # === STOP RECORDING & PROCESS ===
+
+  # Dismiss the recording notification
+  if [ -f "$NOTIF_ID_FILE" ]; then
+    dismiss_notification "$(cat "$NOTIF_ID_FILE")"
+    rm -f "$NOTIF_ID_FILE"
+  fi
+
+  # Stop recording
+  kill "$(cat "$PID_FILE")" 2>/dev/null
+  rm "$PID_FILE"
+
+  # Show processing notification
+  proc_notif=$(send_notification "Dictation" "Transcribing audio..." "audio-input-microphone")
+
+  # Transcribe with Whisper
+  TEXT=$("$WHISPER" -m "$MODEL" -f "$AUDIO" --no-timestamps -nt 2>/dev/null | sed 's/^[[:space:]]*//')
+
+  if [ -n "$TEXT" ]; then
+    # Update notification
+    proc_notif=$(send_notification "Dictation" "Improving text with AI..." "edit-find-replace" "$proc_notif")
+
+    # Read context captured at recording start
+    WINDOW_TITLE=""
+    CLIPBOARD=""
+    SELECTION=""
+    [ -f "$CTX_WINDOW" ] && WINDOW_TITLE=$(cat "$CTX_WINDOW")
+    [ -f "$CTX_CLIPBOARD" ] && CLIPBOARD=$(cat "$CTX_CLIPBOARD")
+    [ -f "$CTX_SELECTION" ] && SELECTION=$(cat "$CTX_SELECTION")
+
+    # Improve text with OpenAI
+    TEXT=$(improve_text_with_llm "$TEXT" "$WINDOW_TITLE" "$CLIPBOARD" "$SELECTION")
+  fi
+
+  # Dismiss processing notification
+  dismiss_notification "$proc_notif"
+
+  if [ -n "$TEXT" ]; then
+    # Copy improved text to clipboard so user can Ctrl+V anywhere
+    echo -n "$TEXT" | xclip -selection clipboard
+
+    # Also type it into the focused window
+    xdotool type --delay 0 --clearmodifiers -- "$TEXT"
+
+    send_notification "Dictation" "Text inserted and copied to clipboard" "dialog-ok" >/dev/null
+  else
+    send_notification "Dictation" "No speech detected" "dialog-warning" >/dev/null
+  fi
+
+  # Clean up
+  rm -f "$AUDIO" "$CTX_WINDOW" "$CTX_CLIPBOARD" "$CTX_SELECTION"
+else
+  # === START RECORDING ===
+
+  # Capture ALL context NOW, before user moves to another window
+  xdotool getactivewindow getwindowname > "$CTX_WINDOW" 2>/dev/null
+  xclip -selection clipboard -o > "$CTX_CLIPBOARD" 2>/dev/null
+  xclip -selection primary -o > "$CTX_SELECTION" 2>/dev/null
+
+  # Show persistent recording notification
+  notif_id=$(send_notification "Recording..." "Press Super+D again to stop and transcribe" "media-record")
+  echo "$notif_id" > "$NOTIF_ID_FILE"
+
+  # Start recording (16kHz mono WAV, required by Whisper)
+  rec -r 16000 -c 1 -b 16 "$AUDIO" &
+  echo $! > "$PID_FILE"
+fi
