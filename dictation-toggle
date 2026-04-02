@@ -68,6 +68,8 @@ Default rules (apply when no embedded instructions override them):
 - Break run-on sentences into clear, concise ones
 - Improve word choice - replace vague words with precise ones
 - Maintain the original tone (formal/informal) and intent
+- PRESERVE the sentence type: questions must remain questions, statements must remain statements, requests must remain requests, exclamations must remain exclamations. Never convert one type to another.
+- PRESERVE the original meaning and intent exactly. Improve HOW it is said, not WHAT is said.
 - If context is provided, adapt the style accordingly (e.g., code comment vs chat message vs email)
 - Output ONLY the improved text, nothing else - no quotes, no explanation, no preamble"
 
