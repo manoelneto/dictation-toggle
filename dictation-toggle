@@ -17,7 +17,6 @@ LOG_FILE="/tmp/whisper-dictation.log"
 
 # Context files - captured at recording START
 CTX_WINDOW="/tmp/whisper-ctx-window"
-CTX_CLIPBOARD="/tmp/whisper-ctx-clipboard"
 CTX_SELECTION="/tmp/whisper-ctx-selection"
 
 # OpenAI API settings (key from OPENAI_API_KEY env variable)
@@ -37,8 +36,7 @@ log_separator() {
 improve_text_with_llm() {
   local raw_text="$1"
   local context_window="$2"
-  local context_clipboard="$3"
-  local context_selection="$4"
+  local context_selection="$3"
 
   local context_block=""
   if [ -n "$context_window" ]; then
@@ -46,9 +44,6 @@ improve_text_with_llm() {
   fi
   if [ -n "$context_selection" ]; then
     context_block="$context_block\nSelected/surrounding text: $context_selection"
-  fi
-  if [ -n "$context_clipboard" ]; then
-    context_block="$context_block\nClipboard content: $context_clipboard"
   fi
 
   local system_prompt="You are a text improvement assistant for voice dictation. Your job is to aggressively restructure and improve dictated text while preserving the original meaning and intent.
@@ -82,7 +77,6 @@ Default rules (apply when no embedded instructions override them):
 
   log "CONTEXT - Window: ${context_window:-(empty)}"
   log "CONTEXT - Selection: ${context_selection:-(empty)}"
-  log "CONTEXT - Clipboard: ${context_clipboard:-(empty)}"
   log "PROMPT - System: $system_prompt"
   log "PROMPT - User message: $user_message"
   log "MODEL: $OPENAI_MODEL"
@@ -190,14 +184,12 @@ if [ -f "$PID_FILE" ]; then
 
     # Read context captured at recording start
     WINDOW_TITLE=""
-    CLIPBOARD=""
     SELECTION=""
     [ -f "$CTX_WINDOW" ] && WINDOW_TITLE=$(cat "$CTX_WINDOW")
-    [ -f "$CTX_CLIPBOARD" ] && CLIPBOARD=$(cat "$CTX_CLIPBOARD")
     [ -f "$CTX_SELECTION" ] && SELECTION=$(cat "$CTX_SELECTION")
 
     # Improve text with OpenAI
-    TEXT=$(improve_text_with_llm "$TEXT" "$WINDOW_TITLE" "$CLIPBOARD" "$SELECTION")
+    TEXT=$(improve_text_with_llm "$TEXT" "$WINDOW_TITLE" "$SELECTION")
   else
     log "WHISPER: No speech detected"
   fi
@@ -220,13 +212,13 @@ if [ -f "$PID_FILE" ]; then
   fi
 
   # Clean up
-  rm -f "$AUDIO" "$CTX_WINDOW" "$CTX_CLIPBOARD" "$CTX_SELECTION"
+  rm -f "$AUDIO" "$CTX_WINDOW" "$CTX_SELECTION"
 else
   # === START RECORDING ===
 
-  # Capture ALL context NOW, before user moves to another window
+  # Capture context NOW, before user moves to another window
+  # Only window title and text selection - clipboard is excluded to avoid leaking unrelated content
   xdotool getactivewindow getwindowname > "$CTX_WINDOW" 2>/dev/null
-  xclip -selection clipboard -o > "$CTX_CLIPBOARD" 2>/dev/null
   xclip -selection primary -o > "$CTX_SELECTION" 2>/dev/null
 
   # Show persistent recording notification
