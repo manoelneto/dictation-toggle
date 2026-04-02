@@ -5,6 +5,9 @@
 # Uses xdotool to type the result into the focused window
 # Result is also copied to clipboard for Ctrl+V
 
+# Load environment variables (needed when run from keyboard shortcut)
+[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
+
 WHISPER="$HOME/.local/share/whisper.cpp/build/bin/whisper-cli"
 MODEL="$HOME/.local/share/whisper.cpp/models/ggml-large-v3.bin"
 AUDIO="/tmp/whisper-recording.wav"
@@ -19,6 +22,17 @@ CTX_SELECTION="/tmp/whisper-ctx-selection"
 
 # OpenAI API settings (key from OPENAI_API_KEY env variable)
 OPENAI_MODEL="gpt-5.4-mini"
+
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$LOG_FILE"
+}
+
+log_separator() {
+  echo "" >> "$LOG_FILE"
+  echo "================================================================" >> "$LOG_FILE"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') | NEW DICTATION SESSION" >> "$LOG_FILE"
+  echo "================================================================" >> "$LOG_FILE"
+}
 
 improve_text_with_llm() {
   local raw_text="$1"
@@ -39,7 +53,15 @@ improve_text_with_llm() {
 
   local system_prompt="You are a text improvement assistant for voice dictation. Your job is to aggressively restructure and improve dictated text while preserving the original meaning and intent.
 
-Rules:
+The dictated text may contain embedded instructions from the user directed at you. These instructions take priority over the default rules below. Examples:
+- 'translate this to Portuguese: ...' -> output the improved text in Portuguese
+- 'make this formal: ...' -> use formal tone
+- 'write this as a bullet list: ...' -> format as bullet points
+- 'summarize: ...' -> output a summary instead of the full text
+Look for cues like 'translate to', 'make this', 'write as', 'in Portuguese', 'em portugues', etc. When you detect an instruction, follow it and strip the instruction itself from the output.
+
+Default rules (apply when no embedded instructions override them):
+- Output in English by default
 - Fix all grammar, punctuation, and spelling errors
 - Restructure sentences for maximum clarity and readability
 - Remove filler words, repetitions, and verbal tics (um, uh, so, like, you know, basically)
@@ -47,9 +69,7 @@ Rules:
 - Improve word choice - replace vague words with precise ones
 - Maintain the original tone (formal/informal) and intent
 - If context is provided, adapt the style accordingly (e.g., code comment vs chat message vs email)
-- Output ONLY the improved text, nothing else - no quotes, no explanation, no preamble
-- Preserve the language of the original text (if Portuguese, output Portuguese; if English, output English)
-- Do NOT translate the text - keep it in the same language as the input"
+- Output ONLY the improved text, nothing else - no quotes, no explanation, no preamble"
 
   local user_message="Improve this dictated text:"
   if [ -n "$context_block" ]; then
@@ -58,6 +78,13 @@ Rules:
     user_message="$user_message\n\n$raw_text"
   fi
 
+  log "CONTEXT - Window: ${context_window:-(empty)}"
+  log "CONTEXT - Selection: ${context_selection:-(empty)}"
+  log "CONTEXT - Clipboard: ${context_clipboard:-(empty)}"
+  log "PROMPT - System: $system_prompt"
+  log "PROMPT - User message: $user_message"
+  log "MODEL: $OPENAI_MODEL"
+
   local payload
   payload=$(jq -n \
     --arg model "$OPENAI_MODEL" \
@@ -65,7 +92,7 @@ Rules:
     --arg user_msg "$user_message" \
     '{
       model: $model,
-      max_tokens: 4096,
+      max_completion_tokens: 4096,
       messages: [
         {role: "system", content: $system},
         {role: "user", content: $user_msg}
@@ -85,10 +112,15 @@ Rules:
   body=$(echo "$response" | sed '$d')
 
   if [ "$http_code" = "200" ]; then
-    echo "$body" | jq -r '.choices[0].message.content'
+    local improved
+    improved=$(echo "$body" | jq -r '.choices[0].message.content')
+    local usage
+    usage=$(echo "$body" | jq -r '"prompt_tokens=\(.usage.prompt_tokens) completion_tokens=\(.usage.completion_tokens) total_tokens=\(.usage.total_tokens)"')
+    log "API SUCCESS (HTTP 200) | $usage"
+    log "IMPROVED TEXT: $improved"
+    echo "$improved"
   else
-    echo "$(date): OpenAI API error (HTTP $http_code): $body" >> "$LOG_FILE"
-    # Fallback to raw text if API fails
+    log "API ERROR (HTTP $http_code): $body"
     echo "$raw_text"
   fi
 }
@@ -140,11 +172,15 @@ if [ -f "$PID_FILE" ]; then
   kill "$(cat "$PID_FILE")" 2>/dev/null
   rm "$PID_FILE"
 
+  log_separator
+
   # Show processing notification
   proc_notif=$(send_notification "Dictation" "Transcribing audio..." "audio-input-microphone")
 
   # Transcribe with Whisper
+  log "WHISPER: Starting transcription..."
   TEXT=$("$WHISPER" -m "$MODEL" -f "$AUDIO" --no-timestamps -nt 2>/dev/null | sed 's/^[[:space:]]*//')
+  log "WHISPER RAW: $TEXT"
 
   if [ -n "$TEXT" ]; then
     # Update notification
@@ -160,6 +196,8 @@ if [ -f "$PID_FILE" ]; then
 
     # Improve text with OpenAI
     TEXT=$(improve_text_with_llm "$TEXT" "$WINDOW_TITLE" "$CLIPBOARD" "$SELECTION")
+  else
+    log "WHISPER: No speech detected"
   fi
 
   # Dismiss processing notification
@@ -172,8 +210,10 @@ if [ -f "$PID_FILE" ]; then
     # Also type it into the focused window
     xdotool type --delay 0 --clearmodifiers -- "$TEXT"
 
+    log "FINAL: Text inserted and copied to clipboard"
     send_notification "Dictation" "Text inserted and copied to clipboard" "dialog-ok" >/dev/null
   else
+    log "FINAL: No speech detected"
     send_notification "Dictation" "No speech detected" "dialog-warning" >/dev/null
   fi
 
